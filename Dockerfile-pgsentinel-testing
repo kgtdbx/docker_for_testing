@@ -1,0 +1,107 @@
+# Used to provision a docker image
+# containing an up to date compiled version of pgsentinel
+# WARNING: This is for testing purpose ONLY 
+#          to verify pgsentinel compilation and behaviour
+#          100% stateless
+
+# Pull base image
+# ---------------
+FROM ubuntu
+
+# Maintainer
+# ----------
+MAINTAINER pgsentinel
+
+# Args required for this build 
+# -------------------------------------------------------------
+
+ARG PG_VERSION=10.5 
+ARG PG_ASH_SAMPLING=1 
+ARG PG_ASH_MAX_ENTRIES=10000
+
+# Environment variables
+# -------------------
+ENV PG_SOURCE=https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.gz \
+    PG_SENTINEL_SOURCE=https://github.com/pgsentinel/pgsentinel \
+    PG_INSTALL_DIR=/usr/local/pgsql${PG_VERSION} \
+    PATH=/usr/local/pgsql${PG_VERSION}/bin:$PATH \
+    PG_WORKDIR=/root/pg_source/
+
+# Install packages
+# add postgres user
+# Setup dir
+# download pg source and compile
+# ------------------------------------------------------------
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git-core wget build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev && \
+    useradd -ms /bin/bash postgres && \
+    mkdir -p $PG_INSTALL_DIR/data && \
+    mkdir -p $PG_WORKDIR && \
+    cd $PG_WORKDIR && \
+    wget --quiet $PG_SOURCE && \
+    tar xvfz postgresql-${PG_VERSION}.tar.gz && \
+    rm -f postgresql-${PG_VERSION}.tar.gz && \
+    cd postgresql-${PG_VERSION} && \
+    ./configure --prefix=$PG_INSTALL_DIR --exec-prefix=$PG_INSTALL_DIR && \
+    make && \
+    make install && \
+    chown postgres $PG_INSTALL_DIR/data
+
+# Switch to postgres
+# -------------------
+USER postgres
+
+# Launch initdb
+# Adjust PostgreSQL configuration
+# -------------------
+
+RUN $PG_INSTALL_DIR/bin/initdb -D $PG_INSTALL_DIR/data && \
+    echo "host all  all    0.0.0.0/0  trust" >> $PG_INSTALL_DIR/data/pg_hba.conf && \
+    echo "listen_addresses='*'" >> $PG_INSTALL_DIR/data/postgresql.conf
+
+# Expose the PostgreSQL port
+# -------------------
+EXPOSE 5432
+
+# Switch to root
+# -------------------
+USER root
+
+# download pgsentinel
+# compile pgsentinel and install
+# compile pg_stat_statements and install
+# -------------------
+RUN git clone $PG_SENTINEL_SOURCE && \
+    cd pgsentinel/src && \
+    make && \
+    make install && \
+    cd $PG_WORKDIR/postgresql-${PG_VERSION}/contrib/pg_stat_statements && \
+    make && \
+    make install && \
+    echo "shared_preload_libraries = 'pg_stat_statements,pgsentinel'" >> $PG_INSTALL_DIR/data/postgresql.conf && \
+    echo "pgsentinel_ash.sampling_period = $PG_ASH_SAMPLING" >> $PG_INSTALL_DIR/data/postgresql.conf && \
+    echo "pgsentinel_ash.max_entries = $PG_ASH_MAX_ENTRIES" >> $PG_INSTALL_DIR/data/postgresql.conf  
+
+# Switch to postgres
+# -------------------
+USER postgres
+
+# start postgres
+# create the extensions and shutdown postgres
+# -------------------
+RUN ($PG_INSTALL_DIR/bin/postgres -D $PG_INSTALL_DIR/data &) && \
+    sleep 20 && \
+    $PG_INSTALL_DIR/bin/psql -c "create extension if not exists pg_stat_statements;" && \
+    $PG_INSTALL_DIR/bin/psql -c "create extension if not exists pgsentinel;" && \
+    $PG_INSTALL_DIR/bin/pg_ctl stop -D $PG_INSTALL_DIR/data -s -m fast
+
+# create startup file
+# -------------------
+RUN echo "#!/bin/bash" >> /home/postgres/startup.sh && \
+    echo "$PG_INSTALL_DIR/bin/postgres -D $PG_INSTALL_DIR/data > /home/postgres/logfile 2>&1 &" >> /home/postgres/startup.sh && \
+    echo "tail -f /home/postgres/logfile" >> /home/postgres/startup.sh && \
+    chmod 700 /home/postgres/startup.sh
+
+# Launch postgres
+# -------------------
+CMD ["/home/postgres/startup.sh"]
